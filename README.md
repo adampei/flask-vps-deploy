@@ -188,6 +188,8 @@ When `--repo-url` is used, the tool will:
 - prompt for GitHub username and token/password only if HTTPS access fails
 - store GitHub credentials with `git credential.helper store` when you choose to provide them
 
+Git credentials are stored per Linux user. Because this tool runs with `sudo`, the stored credentials usually belong to `root` and are then reused by later deploys and redeploys for all projects run through the tool.
+
 This credential helper stores secrets on disk for the root user in plain text. Use a GitHub token with the minimum required scope.
 
 ## Caddy behavior

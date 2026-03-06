@@ -54,7 +54,13 @@ def format_cmd(cmd: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
 
 
-def run(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None) -> None:
+def run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
     print(f"$ {format_cmd(cmd)}")
     subprocess.run(
         cmd,
@@ -62,10 +68,17 @@ def run(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = Non
         input=input_text,
         text=True,
         check=True,
+        env=env,
     )
 
 
-def run_optional(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+def run_optional(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     print(f"$ {format_cmd(cmd)}")
     return subprocess.run(
         cmd,
@@ -74,10 +87,17 @@ def run_optional(cmd: list[str], *, cwd: Path | None = None, input_text: str | N
         text=True,
         check=False,
         capture_output=False,
+        env=env,
     )
 
 
-def capture(cmd: list[str], *, cwd: Path | None = None, check: bool = True) -> str:
+def capture(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> str:
     print(f"$ {format_cmd(cmd)}")
     completed = subprocess.run(
         cmd,
@@ -85,6 +105,7 @@ def capture(cmd: list[str], *, cwd: Path | None = None, check: bool = True) -> s
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
     if check and completed.returncode != 0:
         raise subprocess.CalledProcessError(
@@ -550,29 +571,10 @@ def choose_port(requested_port: int | None, service_path: Path) -> int:
     return selected
 
 
-def ensure_git_identity() -> None:
-    name = subprocess.run(["git", "config", "--global", "user.name"], capture_output=True, text=True)
-    email = subprocess.run(["git", "config", "--global", "user.email"], capture_output=True, text=True)
-
-    current_name = name.stdout.strip() if name.returncode == 0 else ""
-    current_email = email.stdout.strip() if email.returncode == 0 else ""
-    if current_name and current_email:
-        print_step("Global Git author identity already configured")
-        print(f"user.name : {current_name}")
-        print(f"user.email: {current_email}")
-        return
-
-    print_step("Configuring global Git author identity")
-    if not current_name:
-        current_name = prompt("Git user.name")
-        if not current_name:
-            raise SystemExit("Git user.name is required.")
-        run(["git", "config", "--global", "user.name", current_name])
-    if not current_email:
-        current_email = prompt("Git user.email")
-        if not current_email:
-            raise SystemExit("Git user.email is required.")
-        run(["git", "config", "--global", "user.email", current_email])
+def git_noninteractive_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
 
 
 def ensure_git_safe_directory(repo_dir: Path) -> None:
@@ -584,9 +586,7 @@ def ensure_git_safe_directory(repo_dir: Path) -> None:
 
 
 def repo_accessible(repo_url: str) -> bool:
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    completed = subprocess.run(["git", "ls-remote", repo_url], capture_output=True, text=True, env=env)
+    completed = subprocess.run(["git", "ls-remote", repo_url], capture_output=True, text=True, env=git_noninteractive_env())
     return completed.returncode == 0
 
 
@@ -597,6 +597,7 @@ def is_https_github_repo(repo_url: str) -> bool:
 
 def configure_github_credentials(repo_url: str) -> None:
     print_step("Configuring GitHub credentials for HTTPS repository access")
+    print("Credentials are stored once for the current Linux user and reused by later deploys.")
     username = prompt("GitHub username")
     if not username:
         raise SystemExit("GitHub username is required to store credentials.")
@@ -627,6 +628,12 @@ def ensure_repo_access(repo_url: str) -> None:
         raise SystemExit("GitHub repository access still failed after storing credentials.")
 
 
+def run_git_repo_command(cmd: list[str], repo_url: str, *, cwd: Path | None = None) -> None:
+    ensure_repo_access(repo_url)
+    run(cmd, cwd=cwd, env=git_noninteractive_env())
+
+
+
 def clone_or_update_repo(repo_url: str, deploy_dir: Path) -> Path:
     print_step("Preparing project repository")
     deploy_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -638,8 +645,8 @@ def clone_or_update_repo(repo_url: str, deploy_dir: Path) -> Path:
             raise SystemExit(
                 f"Deploy directory already points to a different repository: {origin}"
             )
-        run(["git", "-C", str(deploy_dir), "fetch", "--all", "--prune"])
-        run(["git", "-C", str(deploy_dir), "pull", "--ff-only"])
+        run_git_repo_command(["git", "-C", str(deploy_dir), "fetch", "--all", "--prune"], repo_url)
+        run_git_repo_command(["git", "-C", str(deploy_dir), "pull", "--ff-only"], repo_url)
     else:
         if deploy_dir.exists():
             if any(deploy_dir.iterdir()):
@@ -647,7 +654,7 @@ def clone_or_update_repo(repo_url: str, deploy_dir: Path) -> Path:
                     f"Deploy directory exists and is not an empty git checkout: {deploy_dir}"
                 )
             deploy_dir.rmdir()
-        run(["git", "clone", repo_url, str(deploy_dir)])
+        run_git_repo_command(["git", "clone", repo_url, str(deploy_dir)], repo_url)
 
     return validate_project_dir(deploy_dir, "Repository checkout")
 
