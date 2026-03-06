@@ -99,6 +99,7 @@ The deploy wizard asks for these values in order:
 - domain name
 - service name, defaulting to the project name
 - run user, defaulting to `www-data` or `caddy`
+- workers, defaulting to `2`
 
 If the service already exists, the script reuses its existing internal Gunicorn port.
 If the service is new, the script automatically picks a free port between `8100` and `8999`.

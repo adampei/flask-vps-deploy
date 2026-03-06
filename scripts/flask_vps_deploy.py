@@ -168,6 +168,15 @@ def prompt_yes_no(question: str, default: bool = True) -> bool:
     return value in {"y", "yes"}
 
 
+def prompt_positive_int(question: str, default: int) -> int:
+    raw = prompt(question, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{question} must be an integer.") from exc
+    return ensure_positive(value, question)
+
+
 def validate_domain(domain: str) -> str:
     domain = domain.strip().lower()
     if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", domain):
@@ -1144,7 +1153,7 @@ def command_deploy(args: argparse.Namespace) -> None:
     if args.source_dir and args.repo_url:
         raise SystemExit("Use either --source-dir or --repo-url, not both.")
 
-    workers = ensure_positive(args.workers, "--workers")
+    workers = ensure_positive(args.workers, "--workers") if args.workers is not None else None
     timeout = ensure_positive(args.timeout, "--timeout")
     health_path = normalize_health_path(args.health_path)
 
@@ -1170,6 +1179,9 @@ def command_deploy(args: argparse.Namespace) -> None:
 
     run_user_input = args.run_user or prompt("Run user", detect_default_run_user())
     run_user, run_group = ensure_user_and_group(run_user_input)
+    if workers is None:
+        workers = DEFAULT_WORKERS if args.yes else prompt_positive_int("Workers", DEFAULT_WORKERS)
+
 
     execute_deploy(
         project_input=project_input,
@@ -1245,7 +1257,7 @@ def build_deploy_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--port", type=int, help="Internal Gunicorn port. Defaults to an auto-selected free port.")
     parser.add_argument("--run-user", help="Linux user for the app service. Defaults to www-data or caddy.")
     parser.add_argument("--wsgi-module", default=DEFAULT_WSGI_MODULE, help=f"Gunicorn app entrypoint. Default: {DEFAULT_WSGI_MODULE}")
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Gunicorn worker count. Default: {DEFAULT_WORKERS}")
+    parser.add_argument("--workers", type=int, help=f"Gunicorn worker count. Default: {DEFAULT_WORKERS}")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Gunicorn timeout in seconds. Default: {DEFAULT_TIMEOUT}")
     parser.add_argument("--health-path", default=DEFAULT_HEALTH_PATH, help=f"Path used for post-deploy health checks. Default: {DEFAULT_HEALTH_PATH}")
     parser.add_argument("--skip-health-check", action="store_true", help="Skip the post-deploy health check and rollback logic.")
