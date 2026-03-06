@@ -31,5 +31,6 @@ EOF
 chmod +x "${TARGET_BIN}"
 
 echo "Installed flask-vps-deploy to ${TARGET_BIN}"
-echo "Run it inside your project directory:"
+echo "Run it inside your project directory, or pass --repo-url from anywhere:"
 echo "  sudo flask-vps-deploy"
+echo "  sudo flask-vps-deploy --repo-url https://github.com/yourname/your-flask-app.git"
