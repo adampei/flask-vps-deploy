@@ -864,7 +864,13 @@ def select_service_interactively(services: list[dict[str, str | int | None]]) ->
     return curses.wrapper(selector)
 
 
-def build_redeploy_context(service_name: str, health_path_override: str | None) -> dict[str, str | int | Path | None]:
+def build_redeploy_context(
+    service_name: str,
+    health_path_override: str | None,
+    repo_url_override: str | None,
+    *,
+    allow_prompt: bool,
+) -> dict[str, str | int | Path | None]:
     info = get_service_info(service_name)
     deploy_dir_value = info.get("deploy_dir")
     domain_value = info.get("domain")
@@ -881,10 +887,13 @@ def build_redeploy_context(service_name: str, health_path_override: str | None) 
         raise SystemExit(f"Cannot infer WSGI module from {service_name}.")
 
     deploy_dir = Path(str(deploy_dir_value)).expanduser().resolve()
-    repo_url = get_repo_url_from_checkout(deploy_dir)
+    repo_url = repo_url_override or get_repo_url_from_checkout(deploy_dir)
+    if not repo_url and allow_prompt:
+        repo_url = prompt("Git repository URL")
+        repo_url = repo_url.strip() or None
     if not repo_url:
         raise SystemExit(
-            f"Cannot infer repository URL from {deploy_dir}. redeploy currently requires a git checkout with origin configured."
+            f"Cannot infer repository URL from {deploy_dir}. Pass --repo-url or run redeploy interactively and provide it when prompted."
         )
 
     workers = int(str(info.get("workers") or DEFAULT_WORKERS))
@@ -1148,10 +1157,17 @@ def command_redeploy(args: argparse.Namespace) -> None:
     ensure_systemd_available()
 
     service_name = args.service_name
+    selected_interactively = False
     if not service_name:
         service_name = select_service_interactively(iter_managed_services())
+        selected_interactively = True
 
-    context = build_redeploy_context(service_name, args.health_path)
+    context = build_redeploy_context(
+        service_name,
+        args.health_path,
+        args.repo_url,
+        allow_prompt=(selected_interactively and not args.yes),
+    )
     execute_deploy(
         project_input=str(context["project_input"]),
         repo_url=str(context["repo_url"]),
@@ -1192,6 +1208,7 @@ def build_deploy_parser(parser: argparse.ArgumentParser) -> None:
 
 def build_redeploy_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("service_name", nargs="?", help="Existing service name. If omitted, choose interactively.")
+    parser.add_argument("--repo-url", help="Repository URL to use if origin cannot be inferred from the deployed checkout.")
     parser.add_argument("--health-path", help="Override the health check path for this redeploy. Default: /")
     parser.add_argument("--skip-health-check", action="store_true", help="Skip the post-deploy health check and rollback logic.")
     parser.add_argument("--yes", action="store_true", help="Accept defaults without confirmation.")

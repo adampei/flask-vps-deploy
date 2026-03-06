@@ -51,9 +51,10 @@ Redeploy an existing site by inferring its current config:
 ```bash
 sudo flask-vps-deploy redeploy
 sudo flask-vps-deploy redeploy anime-tactical-simulator-site
+sudo flask-vps-deploy redeploy --repo-url https://github.com/yourname/your-flask-app.git
 ```
 
-If you omit the service name, the CLI opens an interactive picker. Use the Up or Down keys to move, the highlighted row shows the current selection, and Enter confirms it.
+If you omit the service name, the CLI opens an interactive picker. Use the Up or Down keys to move, the highlighted row shows the current selection, and Enter confirms it. If the deployed checkout does not expose `origin`, `redeploy` can prompt for the repository URL or you can pass it with `--repo-url`.
 
 Show one service status, or all managed sites if omitted:
 
@@ -116,6 +117,7 @@ Local source mode:
 Redeploy behavior:
 
 - `flask-vps-deploy redeploy` reverse-infers the current deployment from `systemd`, Caddy, and the deployed Git checkout
+- if the deployed checkout does not expose a usable `origin`, you can provide `--repo-url` or enter it interactively
 - an existing service is explicitly restarted after files and dependencies are updated
 - post-deploy health checks probe both Gunicorn and Caddy locally
 - if health checks fail, the tool restores the previous deploy directory and config files when backups exist
