@@ -36,14 +36,89 @@ RSYNC_EXCLUDES = [
 ]
 KNOWN_COMMANDS = {"deploy", "redeploy", "status", "logs", "access-logs", "list", "self-update"}
 ANSI_RESET = "\033[0m"
+SUCCESS_COLOR = "\033[32m"
+FAILURE_COLOR = "\033[31m"
+WARNING_COLOR = "\033[33m"
 STATE_COLORS = {
-    "active": "\033[32m",
-    "activating": "\033[33m",
-    "reloading": "\033[33m",
-    "inactive": "\033[31m",
-    "failed": "\033[31m",
-    "deactivating": "\033[31m",
+    "active": SUCCESS_COLOR,
+    "activating": WARNING_COLOR,
+    "reloading": WARNING_COLOR,
+    "inactive": FAILURE_COLOR,
+    "failed": FAILURE_COLOR,
+    "deactivating": FAILURE_COLOR,
 }
+
+
+def supports_color() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def colorize_text(value: str, color: str) -> str:
+    if not supports_color():
+        return value
+    return f"{color}{value}{ANSI_RESET}"
+
+
+def success_text(value: str) -> str:
+    return colorize_text(value, SUCCESS_COLOR)
+
+
+def failure_text(value: str) -> str:
+    return colorize_text(value, FAILURE_COLOR)
+
+
+def warning_text(value: str) -> str:
+    return colorize_text(value, WARNING_COLOR)
+
+
+def highlight_short_output(text: str) -> str:
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        prefix = line[: len(line) - len(line.lstrip())]
+        if stripped == "Valid configuration":
+            lines.append(f"{prefix}{success_text(stripped)}")
+        elif stripped in STATE_COLORS:
+            lines.append(f"{prefix}{colorize_state(stripped)}")
+        elif stripped.startswith("Error:") or stripped in {"failed", "inactive"}:
+            lines.append(f"{prefix}{failure_text(stripped)}")
+        else:
+            lines.append(line)
+    highlighted = "\n".join(lines)
+    if text.endswith("\n"):
+        highlighted += "\n"
+    return highlighted
+
+
+def print_result_line(label: str, success: bool, detail: str | None = None) -> None:
+    badge = success_text("SUCCESS") if success else failure_text("FAILED")
+    line = f"{label:<16}: {badge}"
+    if detail:
+        line += f" - {detail}"
+    print(line)
+
+
+def print_deploy_results(
+    results: list[tuple[str, bool, str | None]],
+    *,
+    success: bool,
+    service_name: str,
+    site_path: Path,
+    domain: str,
+) -> None:
+    print("\nResult summary")
+    print("--------------")
+    for label, ok, detail in results:
+        print_result_line(label, ok, detail)
+
+    print("----")
+    if success:
+        print(success_text("Deployment complete"))
+        print(f"App service : systemctl status {service_name}")
+        print(f"Caddy config: {site_path}")
+        print(f"Origin URL  : http://{domain}")
+    else:
+        print(failure_text("Deployment failed"))
 
 
 def print_step(message: str) -> None:
@@ -120,6 +195,38 @@ def capture(
 def run_shell(cmd: str) -> None:
     print(f"$ {cmd}")
     subprocess.run(cmd, shell=True, check=True)
+
+
+def run_reported(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    print(f"$ {format_cmd(cmd)}")
+    completed = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    if completed.stdout:
+        sys.stdout.write(highlight_short_output(completed.stdout))
+    if completed.stderr:
+        sys.stderr.write(highlight_short_output(completed.stderr))
+    if check and completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            cmd,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return completed
 
 
 def require_root() -> None:
@@ -489,7 +596,7 @@ def render_caddy(domain: str, port: int, log_name: str) -> str:
     )
 
 
-def apply_systemd(service_name: str, restart: bool) -> None:
+def apply_systemd(service_name: str, restart: bool) -> str:
     print_step("Reloading systemd and applying app service")
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", service_name])
@@ -497,19 +604,27 @@ def apply_systemd(service_name: str, restart: bool) -> None:
         run(["systemctl", "restart", service_name])
     else:
         run(["systemctl", "start", service_name])
-    run(["systemctl", "is-active", service_name])
+    completed = run_reported(["systemctl", "is-active", service_name], check=False)
+    state = (completed.stdout or completed.stderr).strip() or "unknown"
+    if state != "active":
+        raise SystemExit(f"systemd did not report {service_name} as active.")
+    return state
 
 
-def apply_caddy() -> None:
+def apply_caddy() -> str:
     print_step("Validating and reloading Caddy")
     run(["caddy", "fmt", "--overwrite", "/etc/caddy/Caddyfile"])
     sites_enabled = Path("/etc/caddy/sites-enabled")
     for path in sorted(sites_enabled.glob("*.conf")):
         run(["caddy", "fmt", "--overwrite", str(path)])
-    run(["caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+    run_reported(["caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
     run(["systemctl", "enable", "--now", "caddy"])
     run(["systemctl", "reload", "caddy"])
-    run(["systemctl", "is-active", "caddy"])
+    completed = run_reported(["systemctl", "is-active", "caddy"], check=False)
+    state = (completed.stdout or completed.stderr).strip() or "unknown"
+    if state != "active":
+        raise SystemExit("systemd did not report caddy as active.")
+    return state
 
 
 def best_effort_restore_caddy() -> None:
@@ -693,7 +808,9 @@ def run_health_checks(port: int, domain: str, health_path: str, attempts: int = 
     for attempt in range(1, attempts + 1):
         app_ok = curl_succeeds(app_url)
         proxy_ok = curl_succeeds(proxy_url, host=domain)
-        print(f"Health check attempt {attempt}/{attempts}: app={'ok' if app_ok else 'fail'}, proxy={'ok' if proxy_ok else 'fail'}")
+        app_state = success_text("ok") if app_ok else failure_text("fail")
+        proxy_state = success_text("ok") if proxy_ok else failure_text("fail")
+        print(f"Health check attempt {attempt}/{attempts}: app={app_state}, proxy={proxy_state}")
         if app_ok and proxy_ok:
             return
         time.sleep(delay)
@@ -787,12 +904,10 @@ def service_state(service_name: str) -> str:
 
 
 def colorize_state(value: str) -> str:
-    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
-        return value
     color = STATE_COLORS.get(value)
     if not color:
         return value
-    return f"{color}{value}{ANSI_RESET}"
+    return colorize_text(value, color)
 
 
 def is_managed_service(service_path: Path) -> bool:
@@ -985,15 +1100,23 @@ def execute_deploy(
     if source_dir:
         ensure_not_nested(source_dir, deploy_dir)
 
+    results: list[tuple[str, bool, str | None]] = []
+    current_stage = "Deployment"
+
     if bootstrap_system:
+        current_stage = "System bootstrap"
         package_manager = detect_package_manager()
         install_system_packages(package_manager)
         install_uv_if_needed()
+        results.append((current_stage, True, "Packages, Caddy, and uv ready"))
     else:
         print_step("Skipping system bootstrap for redeploy")
+        results.append(("System bootstrap", True, "Skipped for redeploy"))
 
     if repo_url:
+        current_stage = "Repository access"
         ensure_repo_access(repo_url)
+        results.append((current_stage, True, "Repository reachable"))
 
     service_path = Path("/etc/systemd/system") / f"{service_name}.service"
     site_path = Path("/etc/caddy/sites-enabled") / f"{service_name}.conf"
@@ -1022,18 +1145,24 @@ def execute_deploy(
     had_deploy_backup = snapshot_deploy_dir(deploy_dir, deploy_backup_dir)
 
     try:
+        current_stage = "Project sync"
         if repo_url:
             project_dir = clone_or_update_repo(repo_url, deploy_dir)
             run(["chown", "-R", f"{run_user}:{run_group}", str(project_dir)])
+            results.append((current_stage, True, f"Git checkout ready at {project_dir}"))
         else:
             if not source_dir:
                 raise SystemExit("A source directory is required when repo_url is not provided.")
             sync_project(source_dir, deploy_dir, run_user, run_group)
             project_dir = deploy_dir
+            results.append((current_stage, True, f"Local source synced to {project_dir}"))
 
+        current_stage = "Python env"
         sync_python_env(project_dir)
         run(["chown", "-R", f"{run_user}:{run_group}", str(project_dir)])
+        results.append((current_stage, True, "uv environment synced"))
 
+        current_stage = "App service"
         print_step("Writing systemd and Caddy configuration")
         Path("/var/log/caddy").mkdir(parents=True, exist_ok=True)
         write_text_file(
@@ -1051,19 +1180,30 @@ def execute_deploy(
         )
         ensure_caddy_import(main_caddyfile)
         write_text_file(site_path, render_caddy(domain, port, service_name))
+        app_state = apply_systemd(service_name, restart=service_existed_before)
+        results.append((current_stage, True, f"{service_name} is {app_state}"))
 
-        apply_systemd(service_name, restart=service_existed_before)
-        apply_caddy()
+        current_stage = "Caddy"
+        caddy_state = apply_caddy()
+        results.append((current_stage, True, f"Valid configuration and caddy is {caddy_state}"))
 
-        if not skip_health_check:
+        current_stage = "Health check"
+        if skip_health_check:
+            results.append((current_stage, True, "Skipped by flag"))
+        else:
             run_health_checks(port, domain, health_path)
+            results.append((current_stage, True, f"{health_path} passed via app and proxy"))
 
-        print("\nDone")
-        print("----")
-        print(f"App service : systemctl status {service_name}")
-        print(f"Caddy config: {site_path}")
-        print(f"Origin URL  : http://{domain}")
-    except (SystemExit, subprocess.CalledProcessError):
+        print(f"\n{success_text('Done')}")
+        print_deploy_results(
+            results,
+            success=True,
+            service_name=service_name,
+            site_path=site_path,
+            domain=domain,
+        )
+    except (SystemExit, subprocess.CalledProcessError) as exc:
+        results.append((current_stage, False, str(exc) or None))
         rollback_deploy(
             service_name=service_name,
             deploy_dir=deploy_dir,
@@ -1076,6 +1216,16 @@ def execute_deploy(
             main_caddyfile=main_caddyfile,
             main_caddyfile_existed_before=main_caddyfile_existed_before,
         )
+        results.append(("Rollback", True, "Best-effort restore applied"))
+        print_deploy_results(
+            results,
+            success=False,
+            service_name=service_name,
+            site_path=site_path,
+            domain=domain,
+        )
+        if isinstance(exc, subprocess.CalledProcessError):
+            raise SystemExit("Deployment failed.") from exc
         raise
 
 

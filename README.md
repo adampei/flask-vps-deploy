@@ -13,6 +13,7 @@ Reusable Linux VPS deployment toolkit for Flask projects.
 - creates a `systemd` service for `gunicorn`
 - creates a `Caddy` site config for HTTP-only reverse proxy to support Cloudflare origin mode
 - provides built-in `redeploy`, `status`, `logs`, `access-logs`, `list`, and `self-update` commands
+- highlights key success and failure states in color on TTY terminals and prints a final deployment result summary
 
 ## Included scripts
 
@@ -124,6 +125,7 @@ Redeploy behavior:
 - an existing service is explicitly restarted after files and dependencies are updated
 - post-deploy health checks probe both Gunicorn and Caddy locally
 - if health checks fail, the tool restores the previous deploy directory and config files when backups exist
+- key states such as `Valid configuration`, `active`, `Done`, and failure summaries are colorized when the terminal supports ANSI colors
 
 ## Defaults
 
