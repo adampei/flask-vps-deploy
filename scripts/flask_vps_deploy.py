@@ -371,15 +371,27 @@ def remove_file_if_exists(path: Path) -> None:
 
 
 def ensure_caddy_import(main_caddyfile: Path) -> None:
-    import_line = "import /etc/caddy/sites-enabled/*"
+    import_line = "import /etc/caddy/sites-enabled/*.conf"
+    legacy_import_line = "import /etc/caddy/sites-enabled/*"
+
     if main_caddyfile.exists():
         content = main_caddyfile.read_text()
-        if import_line in content:
-            return
-        if not content.endswith("\n"):
-            content += "\n"
-        new_content = f"{content}\n{import_line}\n"
-        write_text_file(main_caddyfile, new_content)
+        lines = content.splitlines()
+        normalized_lines: list[str] = []
+        seen_import = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped in {import_line, legacy_import_line}:
+                if not seen_import:
+                    normalized_lines.append(import_line)
+                    seen_import = True
+                continue
+            normalized_lines.append(line)
+        if not seen_import:
+            if normalized_lines and normalized_lines[-1] != "":
+                normalized_lines.append("")
+            normalized_lines.append(import_line)
+        write_text_file(main_caddyfile, "\n".join(normalized_lines).rstrip("\n") + "\n")
         return
 
     write_text_file(main_caddyfile, f"{import_line}\n")
@@ -572,7 +584,9 @@ def ensure_git_safe_directory(repo_dir: Path) -> None:
 
 
 def repo_accessible(repo_url: str) -> bool:
-    completed = subprocess.run(["git", "ls-remote", repo_url], capture_output=True, text=True)
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    completed = subprocess.run(["git", "ls-remote", repo_url], capture_output=True, text=True, env=env)
     return completed.returncode == 0
 
 
@@ -582,7 +596,7 @@ def is_https_github_repo(repo_url: str) -> bool:
 
 
 def configure_github_credentials(repo_url: str) -> None:
-    print_step("Configuring GitHub credentials for repository access")
+    print_step("Configuring GitHub credentials for HTTPS repository access")
     username = prompt("GitHub username")
     if not username:
         raise SystemExit("GitHub username is required to store credentials.")
@@ -959,7 +973,6 @@ def execute_deploy(
         print_step("Skipping system bootstrap for redeploy")
 
     if repo_url:
-        ensure_git_identity()
         ensure_repo_access(repo_url)
 
     service_path = Path("/etc/systemd/system") / f"{service_name}.service"

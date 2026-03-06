@@ -184,8 +184,7 @@ If you use a different entrypoint, pass it with `--wsgi-module`.
 
 When `--repo-url` is used, the tool will:
 
-- ensure global `git user.name` and `git user.email` exist
-- check whether the repository is accessible
+- check whether the repository is accessible without prompting
 - prompt for GitHub username and token/password only if HTTPS access fails
 - store GitHub credentials with `git credential.helper store` when you choose to provide them
 
