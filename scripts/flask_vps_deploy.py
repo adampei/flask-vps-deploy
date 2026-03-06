@@ -563,6 +563,14 @@ def ensure_git_identity() -> None:
         run(["git", "config", "--global", "user.email", current_email])
 
 
+def ensure_git_safe_directory(repo_dir: Path) -> None:
+    repo_dir = repo_dir.expanduser().resolve()
+    safe_dirs = capture(["git", "config", "--global", "--get-all", "safe.directory"], check=False)
+    existing = {Path(line).expanduser().resolve() for line in safe_dirs.splitlines() if line.strip()}
+    if repo_dir not in existing:
+        run(["git", "config", "--global", "--add", "safe.directory", str(repo_dir)])
+
+
 def repo_accessible(repo_url: str) -> bool:
     completed = subprocess.run(["git", "ls-remote", repo_url], capture_output=True, text=True)
     return completed.returncode == 0
@@ -610,6 +618,7 @@ def clone_or_update_repo(repo_url: str, deploy_dir: Path) -> Path:
     deploy_dir.parent.mkdir(parents=True, exist_ok=True)
 
     if deploy_dir.exists() and (deploy_dir / ".git").exists():
+        ensure_git_safe_directory(deploy_dir)
         origin = capture(["git", "-C", str(deploy_dir), "remote", "get-url", "origin"])
         if normalize_repo_reference(origin) != normalize_repo_reference(repo_url):
             raise SystemExit(
@@ -633,6 +642,7 @@ def get_repo_url_from_checkout(deploy_dir: Path) -> str | None:
     git_dir = deploy_dir / ".git"
     if not git_dir.exists():
         return None
+    ensure_git_safe_directory(deploy_dir)
     repo_url = capture(["git", "-C", str(deploy_dir), "remote", "get-url", "origin"], check=False)
     return repo_url or None
 
