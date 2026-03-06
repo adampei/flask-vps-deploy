@@ -54,14 +54,15 @@ sudo flask-vps-deploy --repo-url https://github.com/yourname/your-flask-app.git
 
 The wizard now asks for these values in order:
 
-- Git repository URL, or blank to read source from the current directory
+- Git repository URL, or blank to use the current directory as the source
+- deploy directory, defaulting to `/srv/www/<project-name>`
 - domain name
 - service name, defaulting to the project name
-- deploy directory, defaulting to `/srv/www/<service-name>`
 - run user, defaulting to `www-data` or `caddy`
 
 If the service already exists, the script reuses its existing internal Gunicorn port.
 If the service is new, the script automatically picks a free port between `8100` and `8999`.
+If you leave the repository URL blank, the current directory must already be the Flask project source directory.
 
 ## Defaults
 

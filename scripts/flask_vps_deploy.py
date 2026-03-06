@@ -121,7 +121,12 @@ def validate_project_dir(project_dir: Path, label: str) -> Path:
 
 def resolve_source_dir(value: str | None) -> Path:
     source_dir = Path(value or os.getcwd()).expanduser().resolve()
-    return validate_project_dir(source_dir, "Source directory")
+    try:
+        return validate_project_dir(source_dir, "Source directory")
+    except SystemExit as exc:
+        raise SystemExit(
+            f"{exc}. Enter a Git repository URL, or run this command inside your project source directory."
+        ) from exc
 
 
 def ensure_user_and_group(user: str) -> tuple[str, str]:
@@ -548,7 +553,7 @@ def main() -> None:
 
     repo_url = args.repo_url
     if repo_url is None:
-        repo_url = prompt("Git repository URL (leave blank to read source from current directory and deploy into /srv/www/...)")
+        repo_url = prompt("Git repository URL (leave blank to use current directory as the source)")
     repo_url = repo_url.strip() or None
 
     source_dir: Path | None = None
@@ -560,11 +565,11 @@ def main() -> None:
         project_name = guess_project_name(source_dir, None)
         project_input = str(source_dir)
 
-    domain = validate_domain(args.domain) if args.domain else validate_domain(prompt("Domain"))
     service_name_default = project_name
-    service_name = slugify(args.service_name or prompt("Service name", service_name_default))
-    deploy_default = str(DEFAULT_DEPLOY_ROOT / service_name)
+    deploy_default = str(DEFAULT_DEPLOY_ROOT / service_name_default)
     deploy_dir = Path(args.deploy_dir or prompt("Deploy directory", deploy_default)).expanduser().resolve()
+    domain = validate_domain(args.domain) if args.domain else validate_domain(prompt("Domain"))
+    service_name = slugify(args.service_name or prompt("Service name", service_name_default))
 
     if source_dir:
         ensure_not_nested(source_dir, deploy_dir)
