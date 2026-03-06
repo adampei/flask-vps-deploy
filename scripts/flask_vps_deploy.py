@@ -187,9 +187,24 @@ def install_system_packages(package_manager: str) -> None:
                 "curl",
                 "rsync",
                 "ca-certificates",
-                "caddy",
+                "gnupg",
+                "debian-keyring",
+                "debian-archive-keyring",
+                "apt-transport-https",
             ]
         )
+        run_shell(
+            "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' "
+            "| gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg"
+        )
+        run_shell(
+            "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' "
+            "> /etc/apt/sources.list.d/caddy-stable.list"
+        )
+        run(["chmod", "o+r", "/usr/share/keyrings/caddy-stable-archive-keyring.gpg"])
+        run(["chmod", "o+r", "/etc/apt/sources.list.d/caddy-stable.list"])
+        run(["apt-get", "update"])
+        run(["apt-get", "install", "-y", "caddy"])
     else:
         run(
             [

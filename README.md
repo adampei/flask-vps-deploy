@@ -5,7 +5,7 @@ Reusable Linux VPS deployment toolkit for Flask projects.
 ## What it does
 
 - installs or updates the base packages needed for deployment
-- checks whether `caddy` is installed and upgrades it to the latest package version available from the configured repositories
+- checks whether `caddy` is installed and, on Debian or Ubuntu, installs it from the official Caddy apt repository before upgrading
 - installs `uv` if it is missing
 - deploys from either the current local project directory or a Git repository URL
 - creates a `systemd` service for `gunicorn`
@@ -139,4 +139,5 @@ That keeps the origin side HTTP-only so Cloudflare can terminate HTTPS at the ed
 
 - Existing generated service and Caddy config files are backed up with a `.bak` suffix before overwrite.
 - The tool targets Linux systems with `apt-get`, `dnf`, or `yum` and requires `systemd`.
+- On Debian or Ubuntu, the script configures the official Caddy apt repository from Caddy before installing or upgrading `caddy`.
 - Existing deployments reuse their current internal port so multiple sites can coexist on the same VPS.
