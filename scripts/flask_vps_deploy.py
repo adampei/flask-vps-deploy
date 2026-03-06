@@ -34,7 +34,7 @@ RSYNC_EXCLUDES = [
     ".mypy_cache",
     ".pytest_cache",
 ]
-KNOWN_COMMANDS = {"deploy", "status", "logs", "list", "self-update"}
+KNOWN_COMMANDS = {"deploy", "status", "logs", "access-logs", "list", "self-update"}
 ANSI_RESET = "\033[0m"
 STATE_COLORS = {
     "active": "\033[32m",
@@ -832,12 +832,29 @@ def command_status(args: argparse.Namespace) -> None:
     run(["systemctl", "status", service_unit_name(args.service_name), "--no-pager"])
 
 
+def caddy_access_log_path(service_name: str) -> Path:
+    normalized = service_unit_name(service_name)
+    service_stem = Path(normalized).stem
+    return Path("/var/log/caddy") / f"{service_stem}.access.log"
+
+
 def command_logs(args: argparse.Namespace) -> None:
     cmd = ["journalctl", "-u", service_unit_name(args.service_name), "-n", str(args.lines)]
     if args.follow:
         cmd.append("-f")
     else:
         cmd.append("--no-pager")
+    run(cmd)
+
+
+def command_access_logs(args: argparse.Namespace) -> None:
+    log_path = caddy_access_log_path(args.service_name)
+    if not log_path.exists():
+        raise SystemExit(f"Caddy access log not found: {log_path}")
+    cmd = ["tail", "-n", str(args.lines)]
+    if args.follow:
+        cmd.append("-f")
+    cmd.append(str(log_path))
     run(cmd)
 
 
@@ -876,10 +893,15 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Show status for a deployed site.")
     status_parser.add_argument("service_name", nargs="?", help="Service name. If omitted, all managed sites are listed.")
 
-    logs_parser = subparsers.add_parser("logs", help="Show logs for a deployed site.")
+    logs_parser = subparsers.add_parser("logs", help="Show journald logs for a deployed site.")
     logs_parser.add_argument("service_name", help="Service name.")
     logs_parser.add_argument("-n", "--lines", type=int, default=100, help="Number of log lines to show. Default: 100")
     logs_parser.add_argument("-f", "--follow", action="store_true", help="Follow logs in real time.")
+
+    access_logs_parser = subparsers.add_parser("access-logs", help="Show Caddy access logs for a deployed site.")
+    access_logs_parser.add_argument("service_name", help="Service name.")
+    access_logs_parser.add_argument("-n", "--lines", type=int, default=100, help="Number of log lines to show. Default: 100")
+    access_logs_parser.add_argument("-f", "--follow", action="store_true", help="Follow logs in real time.")
 
     subparsers.add_parser("list", help="List all managed sites.")
     subparsers.add_parser("self-update", help="Update flask-vps-deploy itself from GitHub.")
@@ -1035,6 +1057,9 @@ def main() -> None:
     if args.command == "logs":
         command_logs(args)
         return
+    if args.command == "access-logs":
+        command_access_logs(args)
+        return
     if args.command == "list":
         command_list(args)
         return
@@ -1048,5 +1073,8 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print()
+        raise SystemExit(130)
     except subprocess.CalledProcessError as exc:
         raise SystemExit(f"Command failed with exit code {exc.returncode}") from exc

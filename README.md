@@ -12,7 +12,7 @@ Reusable Linux VPS deployment toolkit for Flask projects.
 - runs post-deploy health checks and rolls back to the previous version if checks fail
 - creates a `systemd` service for `gunicorn`
 - creates a `Caddy` site config for HTTP-only reverse proxy to support Cloudflare origin mode
-- provides built-in `status`, `logs`, `list`, and `self-update` commands
+- provides built-in `status`, `logs`, `access-logs`, `list`, and `self-update` commands
 
 ## Included scripts
 
@@ -53,11 +53,18 @@ flask-vps-deploy status
 flask-vps-deploy status anime-tactical-simulator-site
 ```
 
-Show logs:
+Show app journald logs:
 
 ```bash
 flask-vps-deploy logs anime-tactical-simulator-site
 flask-vps-deploy logs anime-tactical-simulator-site -f
+```
+
+Show Caddy access logs:
+
+```bash
+flask-vps-deploy access-logs anime-tactical-simulator-site
+flask-vps-deploy access-logs anime-tactical-simulator-site -f
 ```
 
 List all managed sites:
@@ -179,6 +186,12 @@ The generated Caddy site config listens on:
 - `http://www.example.com`
 
 That keeps the origin side HTTP-only so Cloudflare can terminate HTTPS at the edge while Caddy reverse proxies to Gunicorn locally.
+
+## Logging model
+
+- application and Gunicorn stdout or stderr logs go into `systemd` and are read with `flask-vps-deploy logs <service>`
+- Caddy access logs are written per site to `/var/log/caddy/<service>.access.log` and are read with `flask-vps-deploy access-logs <service>`
+- because journald stores logs by unit, multiple apps do not mix when you query one specific service with `journalctl -u <service>.service`
 
 ## Notes
 
