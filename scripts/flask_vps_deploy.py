@@ -545,12 +545,12 @@ def ensure_git_identity() -> None:
     current_name = name.stdout.strip() if name.returncode == 0 else ""
     current_email = email.stdout.strip() if email.returncode == 0 else ""
     if current_name and current_email:
-        print_step("Global Git identity already configured")
+        print_step("Global Git author identity already configured")
         print(f"user.name : {current_name}")
         print(f"user.email: {current_email}")
         return
 
-    print_step("Configuring global Git identity")
+    print_step("Configuring global Git author identity")
     if not current_name:
         current_name = prompt("Git user.name")
         if not current_name:
@@ -946,13 +946,17 @@ def execute_deploy(
     health_path: str,
     skip_health_check: bool,
     confirm: bool,
+    bootstrap_system: bool,
 ) -> None:
     if source_dir:
         ensure_not_nested(source_dir, deploy_dir)
 
-    package_manager = detect_package_manager()
-    install_system_packages(package_manager)
-    install_uv_if_needed()
+    if bootstrap_system:
+        package_manager = detect_package_manager()
+        install_system_packages(package_manager)
+        install_uv_if_needed()
+    else:
+        print_step("Skipping system bootstrap for redeploy")
 
     if repo_url:
         ensure_git_identity()
@@ -1159,6 +1163,7 @@ def command_deploy(args: argparse.Namespace) -> None:
         health_path=health_path,
         skip_health_check=args.skip_health_check,
         confirm=not args.yes,
+        bootstrap_system=True,
     )
 
 
@@ -1194,6 +1199,7 @@ def command_redeploy(args: argparse.Namespace) -> None:
         health_path=str(context["health_path"]),
         skip_health_check=args.skip_health_check,
         confirm=not args.yes,
+        bootstrap_system=False,
     )
 
 

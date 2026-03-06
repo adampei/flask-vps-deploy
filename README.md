@@ -118,6 +118,7 @@ Redeploy behavior:
 
 - `flask-vps-deploy redeploy` reverse-infers the current deployment from `systemd`, Caddy, and the deployed Git checkout
 - if the deployed checkout does not expose a usable `origin`, you can provide `--repo-url` or enter it interactively
+- redeploy skips the system bootstrap steps and focuses on `git pull`, `uv sync`, service restart, and local health checks
 - an existing service is explicitly restarted after files and dependencies are updated
 - post-deploy health checks probe both Gunicorn and Caddy locally
 - if health checks fail, the tool restores the previous deploy directory and config files when backups exist
