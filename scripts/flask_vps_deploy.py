@@ -899,6 +899,9 @@ def build_redeploy_context(
     service_name: str,
     health_path_override: str | None,
     repo_url_override: str | None,
+    workers_override: int | None,
+    timeout_override: int | None,
+    wsgi_module_override: str | None,
     *,
     allow_prompt: bool,
 ) -> dict[str, str | int | Path | None]:
@@ -927,8 +930,9 @@ def build_redeploy_context(
             f"Cannot infer repository URL from {deploy_dir}. Pass --repo-url or run redeploy interactively and provide it when prompted."
         )
 
-    workers = int(str(info.get("workers") or DEFAULT_WORKERS))
-    timeout = int(str(info.get("timeout") or DEFAULT_TIMEOUT))
+    workers = workers_override if workers_override is not None else int(str(info.get("workers") or DEFAULT_WORKERS))
+    timeout = timeout_override if timeout_override is not None else int(str(info.get("timeout") or DEFAULT_TIMEOUT))
+    wsgi_module = wsgi_module_override or str(wsgi_value)
     port = int(str(info.get("port") or 0)) or None
     health_path = normalize_health_path(health_path_override or DEFAULT_HEALTH_PATH)
     run_user, run_group = ensure_user_and_group(str(run_user_value))
@@ -945,7 +949,7 @@ def build_redeploy_context(
         "requested_port": port,
         "workers": workers,
         "timeout": timeout,
-        "wsgi_module": str(wsgi_value),
+        "wsgi_module": wsgi_module,
         "health_path": health_path,
     }
 
@@ -1197,10 +1201,16 @@ def command_redeploy(args: argparse.Namespace) -> None:
         service_name = select_service_interactively(iter_managed_services())
         selected_interactively = True
 
+    workers_override = ensure_positive(args.workers, "--workers") if args.workers is not None else None
+    timeout_override = ensure_positive(args.timeout, "--timeout") if args.timeout is not None else None
+
     context = build_redeploy_context(
         service_name,
         args.health_path,
         args.repo_url,
+        workers_override,
+        timeout_override,
+        args.wsgi_module,
         allow_prompt=(selected_interactively and not args.yes),
     )
     execute_deploy(
@@ -1245,6 +1255,9 @@ def build_deploy_parser(parser: argparse.ArgumentParser) -> None:
 def build_redeploy_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("service_name", nargs="?", help="Existing service name. If omitted, choose interactively.")
     parser.add_argument("--repo-url", help="Repository URL to use if origin cannot be inferred from the deployed checkout.")
+    parser.add_argument("--wsgi-module", help="Override the current Gunicorn app entrypoint for this redeploy.")
+    parser.add_argument("--workers", type=int, help="Override the current Gunicorn worker count for this redeploy.")
+    parser.add_argument("--timeout", type=int, help="Override the current Gunicorn timeout in seconds for this redeploy.")
     parser.add_argument("--health-path", help="Override the health check path for this redeploy. Default: /")
     parser.add_argument("--skip-health-check", action="store_true", help="Skip the post-deploy health check and rollback logic.")
     parser.add_argument("--yes", action="store_true", help="Accept defaults without confirmation.")

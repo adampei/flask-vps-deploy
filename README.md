@@ -51,10 +51,11 @@ Redeploy an existing site by inferring its current config:
 ```bash
 sudo flask-vps-deploy redeploy
 sudo flask-vps-deploy redeploy anime-tactical-simulator-site
+sudo flask-vps-deploy redeploy anime-tactical-simulator-site --workers 2
 sudo flask-vps-deploy redeploy --repo-url https://github.com/yourname/your-flask-app.git
 ```
 
-If you omit the service name, the CLI opens an interactive picker. Use the Up or Down keys to move, the highlighted row shows the current selection, and Enter confirms it. If the deployed checkout does not expose `origin`, `redeploy` can prompt for the repository URL or you can pass it with `--repo-url`.
+If you omit the service name, the CLI opens an interactive picker. Use the Up or Down keys to move, the highlighted row shows the current selection, and Enter confirms it. If the deployed checkout does not expose `origin`, `redeploy` can prompt for the repository URL or you can pass it with `--repo-url`. By default, `redeploy` keeps the current `workers`, `timeout`, and `wsgi module` from the existing service unless you override them.
 
 Show one service status, or all managed sites if omitted:
 
