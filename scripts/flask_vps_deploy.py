@@ -35,6 +35,15 @@ RSYNC_EXCLUDES = [
     ".pytest_cache",
 ]
 KNOWN_COMMANDS = {"deploy", "status", "logs", "list", "self-update"}
+ANSI_RESET = "\033[0m"
+STATE_COLORS = {
+    "active": "\033[32m",
+    "activating": "\033[33m",
+    "reloading": "\033[33m",
+    "inactive": "\033[31m",
+    "failed": "\033[31m",
+    "deactivating": "\033[31m",
+}
 
 
 def print_step(message: str) -> None:
@@ -724,6 +733,15 @@ def service_state(service_name: str) -> str:
     return (completed.stdout or completed.stderr).strip() or "unknown"
 
 
+def colorize_state(value: str) -> str:
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return value
+    color = STATE_COLORS.get(value)
+    if not color:
+        return value
+    return f"{color}{value}{ANSI_RESET}"
+
+
 def is_managed_service(service_path: Path) -> bool:
     content = service_path.read_text()
     return "Managed by flask-vps-deploy" in content or (
@@ -787,7 +805,7 @@ def command_list(_: argparse.Namespace) -> None:
     print("Managed sites")
     print("-------------")
     for info in services:
-        print(f"{info['service_name']} [{info['state']}]")
+        print(f"{info['service_name']} [{colorize_state(str(info['state']))}]")
         print(f"  domain    : {info['domain'] or '-'}")
         print(f"  deploy dir: {info['deploy_dir'] or '-'}")
         print(f"  port      : {info['port'] or '-'}")
@@ -803,7 +821,7 @@ def command_status(args: argparse.Namespace) -> None:
     print("Service summary")
     print("---------------")
     print(f"Service    : {info['service_name']}")
-    print(f"State      : {info['state']}")
+    print(f"State      : {colorize_state(str(info['state']))}")
     print(f"Domain     : {info['domain'] or '-'}")
     print(f"Deploy dir : {info['deploy_dir'] or '-'}")
     print(f"Port       : {info['port'] or '-'}")
