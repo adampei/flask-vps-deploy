@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+scripts/__pycache__/
+.mypy_cache/
+.pytest_cache/
+.DS_Store
+
+# private project files kept out of the public tool repo
+app.py
+site_data.py
+wsgi.py
+templates/
+static/
+deploy/
+词根.txt

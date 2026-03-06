@@ -1,0 +1,10 @@
+[project]
+name = "flask-vps-deploy"
+version = "0.1.0"
+description = "Reusable VPS deployment toolkit for Flask projects."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
