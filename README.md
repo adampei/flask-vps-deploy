@@ -12,7 +12,7 @@ Reusable Linux VPS deployment toolkit for Flask projects.
 - runs post-deploy health checks and rolls back to the previous version if checks fail
 - creates a `systemd` service for `gunicorn`
 - creates a `Caddy` site config for HTTP-only reverse proxy to support Cloudflare origin mode
-- provides built-in `status`, `logs`, `access-logs`, `list`, and `self-update` commands
+- provides built-in `redeploy`, `status`, `logs`, `access-logs`, `list`, and `self-update` commands
 
 ## Included scripts
 
@@ -45,6 +45,15 @@ Deploy or update a site:
 ```bash
 sudo flask-vps-deploy
 ```
+
+Redeploy an existing site by inferring its current config:
+
+```bash
+sudo flask-vps-deploy redeploy
+sudo flask-vps-deploy redeploy anime-tactical-simulator-site
+```
+
+If you omit the service name, the CLI opens an interactive picker. Use the Up or Down keys to move, the highlighted row shows the current selection, and Enter confirms it.
 
 Show one service status, or all managed sites if omitted:
 
@@ -106,6 +115,7 @@ Local source mode:
 
 Redeploy behavior:
 
+- `flask-vps-deploy redeploy` reverse-infers the current deployment from `systemd`, Caddy, and the deployed Git checkout
 - an existing service is explicitly restarted after files and dependencies are updated
 - post-deploy health checks probe both Gunicorn and Caddy locally
 - if health checks fail, the tool restores the previous deploy directory and config files when backups exist

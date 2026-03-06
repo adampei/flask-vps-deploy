@@ -34,7 +34,7 @@ RSYNC_EXCLUDES = [
     ".mypy_cache",
     ".pytest_cache",
 ]
-KNOWN_COMMANDS = {"deploy", "status", "logs", "access-logs", "list", "self-update"}
+KNOWN_COMMANDS = {"deploy", "redeploy", "status", "logs", "access-logs", "list", "self-update"}
 ANSI_RESET = "\033[0m"
 STATE_COLORS = {
     "active": "\033[32m",
@@ -104,6 +104,11 @@ def run_shell(cmd: str) -> None:
 def require_root() -> None:
     if os.geteuid() != 0:
         raise SystemExit("This command must run as root. Use sudo or switch to root.")
+
+
+def ensure_systemd_available() -> None:
+    if not shutil.which("systemctl"):
+        raise SystemExit("systemd is required on the target VPS.")
 
 
 def detect_package_manager() -> str:
@@ -624,6 +629,14 @@ def clone_or_update_repo(repo_url: str, deploy_dir: Path) -> Path:
     return validate_project_dir(deploy_dir, "Repository checkout")
 
 
+def get_repo_url_from_checkout(deploy_dir: Path) -> str | None:
+    git_dir = deploy_dir / ".git"
+    if not git_dir.exists():
+        return None
+    repo_url = capture(["git", "-C", str(deploy_dir), "remote", "get-url", "origin"], check=False)
+    return repo_url or None
+
+
 def curl_succeeds(url: str, *, host: str | None = None, timeout: int = 5) -> bool:
     cmd = ["curl", "-fsS", "-o", "/dev/null", "--max-time", str(timeout), url]
     if host:
@@ -796,6 +809,220 @@ def iter_managed_services() -> list[dict[str, str | int | None]]:
     return services
 
 
+def select_service_interactively(services: list[dict[str, str | int | None]]) -> str:
+    if not services:
+        raise SystemExit("No flask-vps-deploy managed sites found.")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise SystemExit("Interactive service selection requires a TTY. Pass a service name explicitly.")
+
+    import curses
+
+    def draw_line(stdscr: curses.window, row: int, text: str, width: int, selected: bool) -> None:
+        if selected:
+            stdscr.attron(curses.A_REVERSE)
+        stdscr.addnstr(row, 0, text, max(1, width - 1))
+        if selected:
+            stdscr.attroff(curses.A_REVERSE)
+
+    def selector(stdscr: curses.window) -> str:
+        index = 0
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+
+        while True:
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+            header = "Select a deployed site to redeploy (Up/Down to move, Enter to confirm, q to quit)"
+            draw_line(stdscr, 0, header, width, False)
+
+            visible_rows = max(1, height - 2)
+            start = max(0, min(index - visible_rows + 1, max(0, len(services) - visible_rows)))
+            visible = services[start : start + visible_rows]
+
+            for offset, info in enumerate(visible, start=1):
+                actual_index = start + offset - 1
+                line = (
+                    f"{info['service_name']} [{info['state']}] "
+                    f"{info['domain'] or '-'} -> {info['deploy_dir'] or '-'}"
+                )
+                draw_line(stdscr, offset, line, width, actual_index == index)
+
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                index = (index - 1) % len(services)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                index = (index + 1) % len(services)
+            elif key in (10, 13, curses.KEY_ENTER):
+                return str(services[index]["service_name"])
+            elif key in (27, ord("q")):
+                raise SystemExit("Cancelled.")
+
+    return curses.wrapper(selector)
+
+
+def build_redeploy_context(service_name: str, health_path_override: str | None) -> dict[str, str | int | Path | None]:
+    info = get_service_info(service_name)
+    deploy_dir_value = info.get("deploy_dir")
+    domain_value = info.get("domain")
+    run_user_value = info.get("run_user")
+    wsgi_value = info.get("wsgi_module")
+
+    if not deploy_dir_value:
+        raise SystemExit(f"Cannot infer deploy directory from {service_name}.")
+    if not domain_value:
+        raise SystemExit(f"Cannot infer domain from Caddy config for {service_name}.")
+    if not run_user_value:
+        raise SystemExit(f"Cannot infer run user from {service_name}.")
+    if not wsgi_value:
+        raise SystemExit(f"Cannot infer WSGI module from {service_name}.")
+
+    deploy_dir = Path(str(deploy_dir_value)).expanduser().resolve()
+    repo_url = get_repo_url_from_checkout(deploy_dir)
+    if not repo_url:
+        raise SystemExit(
+            f"Cannot infer repository URL from {deploy_dir}. redeploy currently requires a git checkout with origin configured."
+        )
+
+    workers = int(str(info.get("workers") or DEFAULT_WORKERS))
+    timeout = int(str(info.get("timeout") or DEFAULT_TIMEOUT))
+    port = int(str(info.get("port") or 0)) or None
+    health_path = normalize_health_path(health_path_override or DEFAULT_HEALTH_PATH)
+    run_user, run_group = ensure_user_and_group(str(run_user_value))
+
+    return {
+        "project_input": repo_url,
+        "repo_url": repo_url,
+        "source_dir": None,
+        "domain": str(domain_value),
+        "deploy_dir": deploy_dir,
+        "service_name": str(info["service_name"]),
+        "run_user": run_user,
+        "run_group": run_group,
+        "requested_port": port,
+        "workers": workers,
+        "timeout": timeout,
+        "wsgi_module": str(wsgi_value),
+        "health_path": health_path,
+    }
+
+
+def execute_deploy(
+    *,
+    project_input: str,
+    repo_url: str | None,
+    source_dir: Path | None,
+    domain: str,
+    deploy_dir: Path,
+    service_name: str,
+    run_user: str,
+    run_group: str,
+    requested_port: int | None,
+    workers: int,
+    timeout: int,
+    wsgi_module: str,
+    health_path: str,
+    skip_health_check: bool,
+    confirm: bool,
+) -> None:
+    if source_dir:
+        ensure_not_nested(source_dir, deploy_dir)
+
+    package_manager = detect_package_manager()
+    install_system_packages(package_manager)
+    install_uv_if_needed()
+
+    if repo_url:
+        ensure_git_identity()
+        ensure_repo_access(repo_url)
+
+    service_path = Path("/etc/systemd/system") / f"{service_name}.service"
+    site_path = Path("/etc/caddy/sites-enabled") / f"{service_name}.conf"
+    main_caddyfile = Path("/etc/caddy/Caddyfile")
+    port = choose_port(requested_port, service_path)
+
+    print_summary(
+        project_input,
+        domain,
+        deploy_dir,
+        service_name,
+        port,
+        run_user,
+        workers,
+        timeout,
+        wsgi_module,
+        health_path,
+    )
+    if confirm and not prompt_yes_no("Continue with deployment?", True):
+        raise SystemExit("Cancelled.")
+
+    service_existed_before = service_path.exists()
+    site_existed_before = site_path.exists()
+    main_caddyfile_existed_before = main_caddyfile.exists()
+    deploy_backup_dir = BACKUP_ROOT / service_name
+    had_deploy_backup = snapshot_deploy_dir(deploy_dir, deploy_backup_dir)
+
+    try:
+        if repo_url:
+            project_dir = clone_or_update_repo(repo_url, deploy_dir)
+            run(["chown", "-R", f"{run_user}:{run_group}", str(project_dir)])
+        else:
+            if not source_dir:
+                raise SystemExit("A source directory is required when repo_url is not provided.")
+            sync_project(source_dir, deploy_dir, run_user, run_group)
+            project_dir = deploy_dir
+
+        sync_python_env(project_dir)
+        run(["chown", "-R", f"{run_user}:{run_group}", str(project_dir)])
+
+        print_step("Writing systemd and Caddy configuration")
+        Path("/var/log/caddy").mkdir(parents=True, exist_ok=True)
+        write_text_file(
+            service_path,
+            render_service(
+                service_name,
+                project_dir,
+                run_user,
+                run_group,
+                port,
+                workers,
+                timeout,
+                wsgi_module,
+            ),
+        )
+        ensure_caddy_import(main_caddyfile)
+        write_text_file(site_path, render_caddy(domain, port, service_name))
+
+        apply_systemd(service_name, restart=service_existed_before)
+        apply_caddy()
+
+        if not skip_health_check:
+            run_health_checks(port, domain, health_path)
+
+        print("\nDone")
+        print("----")
+        print(f"App service : systemctl status {service_name}")
+        print(f"Caddy config: {site_path}")
+        print(f"Origin URL  : http://{domain}")
+    except (SystemExit, subprocess.CalledProcessError):
+        rollback_deploy(
+            service_name=service_name,
+            deploy_dir=deploy_dir,
+            deploy_backup_dir=deploy_backup_dir,
+            had_deploy_backup=had_deploy_backup,
+            service_path=service_path,
+            service_existed_before=service_existed_before,
+            site_path=site_path,
+            site_existed_before=site_existed_before,
+            main_caddyfile=main_caddyfile,
+            main_caddyfile_existed_before=main_caddyfile_existed_before,
+        )
+        raise
+
+
 def command_list(_: argparse.Namespace) -> None:
     services = iter_managed_services()
     if not services:
@@ -864,6 +1091,86 @@ def command_self_update(_: argparse.Namespace) -> None:
     run_shell(f"curl -fsSL {INSTALL_SCRIPT_URL} | bash")
 
 
+def command_deploy(args: argparse.Namespace) -> None:
+    require_root()
+    ensure_systemd_available()
+    if args.source_dir and args.repo_url:
+        raise SystemExit("Use either --source-dir or --repo-url, not both.")
+
+    workers = ensure_positive(args.workers, "--workers")
+    timeout = ensure_positive(args.timeout, "--timeout")
+    health_path = normalize_health_path(args.health_path)
+
+    repo_url = args.repo_url
+    if repo_url is None:
+        repo_url = prompt("Git repository URL (leave blank to use current directory as the source)")
+    repo_url = repo_url.strip() or None
+
+    source_dir: Path | None = None
+    if repo_url:
+        project_name = guess_project_name(None, repo_url)
+        project_input = repo_url
+    else:
+        source_dir = resolve_source_dir(args.source_dir)
+        project_name = guess_project_name(source_dir, None)
+        project_input = str(source_dir)
+
+    service_name_default = project_name
+    deploy_default = str(DEFAULT_DEPLOY_ROOT / service_name_default)
+    deploy_dir = Path(args.deploy_dir or prompt("Deploy directory", deploy_default)).expanduser().resolve()
+    domain = validate_domain(args.domain) if args.domain else validate_domain(prompt("Domain"))
+    service_name = slugify(args.service_name or prompt("Service name", service_name_default))
+
+    run_user_input = args.run_user or prompt("Run user", detect_default_run_user())
+    run_user, run_group = ensure_user_and_group(run_user_input)
+
+    execute_deploy(
+        project_input=project_input,
+        repo_url=repo_url,
+        source_dir=source_dir,
+        domain=domain,
+        deploy_dir=deploy_dir,
+        service_name=service_name,
+        run_user=run_user,
+        run_group=run_group,
+        requested_port=args.port,
+        workers=workers,
+        timeout=timeout,
+        wsgi_module=args.wsgi_module,
+        health_path=health_path,
+        skip_health_check=args.skip_health_check,
+        confirm=not args.yes,
+    )
+
+
+def command_redeploy(args: argparse.Namespace) -> None:
+    require_root()
+    ensure_systemd_available()
+
+    service_name = args.service_name
+    if not service_name:
+        service_name = select_service_interactively(iter_managed_services())
+
+    context = build_redeploy_context(service_name, args.health_path)
+    execute_deploy(
+        project_input=str(context["project_input"]),
+        repo_url=str(context["repo_url"]),
+        source_dir=None,
+        domain=str(context["domain"]),
+        deploy_dir=Path(context["deploy_dir"]),
+        service_name=str(context["service_name"]),
+        run_user=str(context["run_user"]),
+        run_group=str(context["run_group"]),
+        requested_port=int(context["requested_port"]) if context["requested_port"] is not None else None,
+        workers=int(context["workers"]),
+        timeout=int(context["timeout"]),
+        wsgi_module=str(context["wsgi_module"]),
+        health_path=str(context["health_path"]),
+        skip_health_check=args.skip_health_check,
+        confirm=not args.yes,
+    )
+
+
 def build_deploy_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--source-dir",
@@ -883,12 +1190,22 @@ def build_deploy_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--yes", action="store_true", help="Accept defaults without confirmation.")
 
 
+def build_redeploy_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("service_name", nargs="?", help="Existing service name. If omitted, choose interactively.")
+    parser.add_argument("--health-path", help="Override the health check path for this redeploy. Default: /")
+    parser.add_argument("--skip-health-check", action="store_true", help="Skip the post-deploy health check and rollback logic.")
+    parser.add_argument("--yes", action="store_true", help="Accept defaults without confirmation.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Flask VPS deploy and maintenance toolkit.")
     subparsers = parser.add_subparsers(dest="command")
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy or update a Flask site.")
     build_deploy_parser(deploy_parser)
+
+    redeploy_parser = subparsers.add_parser("redeploy", help="Redeploy an existing site by inferring its current configuration.")
+    build_redeploy_parser(redeploy_parser)
 
     status_parser = subparsers.add_parser("status", help="Show status for a deployed site.")
     status_parser.add_argument("service_name", nargs="?", help="Service name. If omitted, all managed sites are listed.")
@@ -918,138 +1235,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(raw_args)
 
 
-def command_deploy(args: argparse.Namespace) -> None:
-    require_root()
-    if not shutil.which("systemctl"):
-        raise SystemExit("systemd is required on the target VPS.")
-    if args.source_dir and args.repo_url:
-        raise SystemExit("Use either --source-dir or --repo-url, not both.")
-
-    workers = ensure_positive(args.workers, "--workers")
-    timeout = ensure_positive(args.timeout, "--timeout")
-    health_path = normalize_health_path(args.health_path)
-
-    repo_url = args.repo_url
-    if repo_url is None:
-        repo_url = prompt("Git repository URL (leave blank to use current directory as the source)")
-    repo_url = repo_url.strip() or None
-
-    source_dir: Path | None = None
-    if repo_url:
-        project_name = guess_project_name(None, repo_url)
-        project_input = repo_url
-    else:
-        source_dir = resolve_source_dir(args.source_dir)
-        project_name = guess_project_name(source_dir, None)
-        project_input = str(source_dir)
-
-    service_name_default = project_name
-    deploy_default = str(DEFAULT_DEPLOY_ROOT / service_name_default)
-    deploy_dir = Path(args.deploy_dir or prompt("Deploy directory", deploy_default)).expanduser().resolve()
-    domain = validate_domain(args.domain) if args.domain else validate_domain(prompt("Domain"))
-    service_name = slugify(args.service_name or prompt("Service name", service_name_default))
-
-    if source_dir:
-        ensure_not_nested(source_dir, deploy_dir)
-
-    package_manager = detect_package_manager()
-    install_system_packages(package_manager)
-    install_uv_if_needed()
-
-    if repo_url:
-        ensure_git_identity()
-        ensure_repo_access(repo_url)
-
-    run_user_input = args.run_user or prompt("Run user", detect_default_run_user())
-    run_user, run_group = ensure_user_and_group(run_user_input)
-
-    service_path = Path("/etc/systemd/system") / f"{service_name}.service"
-    site_path = Path("/etc/caddy/sites-enabled") / f"{service_name}.conf"
-    main_caddyfile = Path("/etc/caddy/Caddyfile")
-    port = choose_port(args.port, service_path)
-
-    print_summary(
-        project_input,
-        domain,
-        deploy_dir,
-        service_name,
-        port,
-        run_user,
-        workers,
-        timeout,
-        args.wsgi_module,
-        health_path,
-    )
-    if not args.yes and not prompt_yes_no("Continue with deployment?", True):
-        raise SystemExit("Cancelled.")
-
-    service_existed_before = service_path.exists()
-    site_existed_before = site_path.exists()
-    main_caddyfile_existed_before = main_caddyfile.exists()
-    deploy_backup_dir = BACKUP_ROOT / service_name
-    had_deploy_backup = snapshot_deploy_dir(deploy_dir, deploy_backup_dir)
-
-    try:
-        if repo_url:
-            project_dir = clone_or_update_repo(repo_url, deploy_dir)
-            run(["chown", "-R", f"{run_user}:{run_group}", str(project_dir)])
-        else:
-            sync_project(source_dir, deploy_dir, run_user, run_group)
-            project_dir = deploy_dir
-
-        sync_python_env(project_dir)
-        run(["chown", "-R", f"{run_user}:{run_group}", str(project_dir)])
-
-        print_step("Writing systemd and Caddy configuration")
-        Path("/var/log/caddy").mkdir(parents=True, exist_ok=True)
-        write_text_file(
-            service_path,
-            render_service(
-                service_name,
-                project_dir,
-                run_user,
-                run_group,
-                port,
-                workers,
-                timeout,
-                args.wsgi_module,
-            ),
-        )
-        ensure_caddy_import(main_caddyfile)
-        write_text_file(site_path, render_caddy(domain, port, service_name))
-
-        apply_systemd(service_name, restart=service_existed_before)
-        apply_caddy()
-
-        if not args.skip_health_check:
-            run_health_checks(port, domain, health_path)
-
-        print("\nDone")
-        print("----")
-        print(f"App service : systemctl status {service_name}")
-        print(f"Caddy config: {site_path}")
-        print(f"Origin URL  : http://{domain}")
-    except (SystemExit, subprocess.CalledProcessError):
-        rollback_deploy(
-            service_name=service_name,
-            deploy_dir=deploy_dir,
-            deploy_backup_dir=deploy_backup_dir,
-            had_deploy_backup=had_deploy_backup,
-            service_path=service_path,
-            service_existed_before=service_existed_before,
-            site_path=site_path,
-            site_existed_before=site_existed_before,
-            main_caddyfile=main_caddyfile,
-            main_caddyfile_existed_before=main_caddyfile_existed_before,
-        )
-        raise
-
-
 def main() -> None:
     args = parse_args()
 
     if args.command == "deploy":
         command_deploy(args)
+        return
+    if args.command == "redeploy":
+        command_redeploy(args)
         return
     if args.command == "status":
         command_status(args)
