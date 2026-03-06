@@ -11,7 +11,9 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import textwrap
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,6 +21,12 @@ from urllib.parse import urlparse
 DEFAULT_PORT_START = 8100
 DEFAULT_PORT_END = 8999
 DEFAULT_DEPLOY_ROOT = Path("/srv/www")
+DEFAULT_WORKERS = 2
+DEFAULT_TIMEOUT = 60
+DEFAULT_WSGI_MODULE = "wsgi:app"
+DEFAULT_HEALTH_PATH = "/"
+INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/adampei/flask-vps-deploy/main/install.sh"
+BACKUP_ROOT = Path("/var/lib/flask-vps-deploy/backups")
 RSYNC_EXCLUDES = [
     ".git",
     ".venv",
@@ -26,15 +34,19 @@ RSYNC_EXCLUDES = [
     ".mypy_cache",
     ".pytest_cache",
 ]
+KNOWN_COMMANDS = {"deploy", "status", "logs", "list", "self-update"}
 
 
 def print_step(message: str) -> None:
     print(f"\n==> {message}")
 
 
+def format_cmd(cmd: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in cmd)
+
+
 def run(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None) -> None:
-    pretty = " ".join(shlex.quote(part) for part in cmd)
-    print(f"$ {pretty}")
+    print(f"$ {format_cmd(cmd)}")
     subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -44,16 +56,34 @@ def run(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = Non
     )
 
 
-def capture(cmd: list[str], *, cwd: Path | None = None) -> str:
-    pretty = " ".join(shlex.quote(part) for part in cmd)
-    print(f"$ {pretty}")
+def run_optional(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    print(f"$ {format_cmd(cmd)}")
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        input=input_text,
+        text=True,
+        check=False,
+        capture_output=False,
+    )
+
+
+def capture(cmd: list[str], *, cwd: Path | None = None, check: bool = True) -> str:
+    print(f"$ {format_cmd(cmd)}")
     completed = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    if check and completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            cmd,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
     return completed.stdout.strip()
 
 
@@ -155,6 +185,19 @@ def guess_project_name(source_dir: Path | None, repo_url: str | None) -> str:
     if not source_dir:
         raise SystemExit("Unable to determine a project name without a source directory or repository URL.")
     return slugify(source_dir.name)
+
+
+def ensure_positive(value: int, label: str) -> int:
+    if value <= 0:
+        raise SystemExit(f"{label} must be greater than zero.")
+    return value
+
+
+def normalize_health_path(value: str) -> str:
+    path = value.strip() or DEFAULT_HEALTH_PATH
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return path
 
 
 def get_caddy_version() -> str | None:
@@ -266,6 +309,20 @@ def sync_project(source_dir: Path, deploy_dir: Path, user: str, group: str) -> N
     run(["chown", "-R", f"{user}:{group}", str(deploy_dir)])
 
 
+def snapshot_deploy_dir(deploy_dir: Path, backup_dir: Path) -> bool:
+    if not deploy_dir.exists() or not any(deploy_dir.iterdir()):
+        return False
+    print_step("Creating deploy backup")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    run(["rsync", "-a", "--delete", f"{deploy_dir}/", f"{backup_dir}/"])
+    return True
+
+
+def restore_deploy_dir(backup_dir: Path, deploy_dir: Path) -> None:
+    deploy_dir.mkdir(parents=True, exist_ok=True)
+    run(["rsync", "-a", "--delete", f"{backup_dir}/", f"{deploy_dir}/"])
+
+
 def sync_python_env(deploy_dir: Path) -> None:
     print_step("Syncing Python environment with uv")
     lock_file = deploy_dir / "uv.lock"
@@ -284,6 +341,21 @@ def write_text_file(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def restore_file_from_backup(path: Path) -> bool:
+    backup = path.with_name(f"{path.name}.bak")
+    if not backup.exists():
+        return False
+    shutil.copy2(backup, path)
+    return True
+
+
+def remove_file_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
 def ensure_caddy_import(main_caddyfile: Path) -> None:
     import_line = "import /etc/caddy/sites-enabled/*"
     if main_caddyfile.exists():
@@ -292,16 +364,26 @@ def ensure_caddy_import(main_caddyfile: Path) -> None:
             return
         if not content.endswith("\n"):
             content += "\n"
-        content += f"\n{import_line}\n"
-        main_caddyfile.write_text(content)
+        new_content = f"{content}\n{import_line}\n"
+        write_text_file(main_caddyfile, new_content)
         return
 
-    main_caddyfile.write_text(f"{import_line}\n")
+    write_text_file(main_caddyfile, f"{import_line}\n")
 
 
-def render_service(service_name: str, deploy_dir: Path, run_user: str, run_group: str, port: int) -> str:
+def render_service(
+    service_name: str,
+    deploy_dir: Path,
+    run_user: str,
+    run_group: str,
+    port: int,
+    workers: int,
+    timeout: int,
+    wsgi_module: str,
+) -> str:
     return textwrap.dedent(
         f"""\
+        # Managed by flask-vps-deploy
         [Unit]
         Description={service_name} Flask app
         After=network.target
@@ -312,7 +394,7 @@ def render_service(service_name: str, deploy_dir: Path, run_user: str, run_group
         Group={run_group}
         WorkingDirectory={deploy_dir}
         Environment=PYTHONUNBUFFERED=1
-        ExecStart={deploy_dir}/.venv/bin/gunicorn --workers 3 --bind 127.0.0.1:{port} --timeout 60 wsgi:app
+        ExecStart={deploy_dir}/.venv/bin/gunicorn --workers {workers} --bind 127.0.0.1:{port} --timeout {timeout} {wsgi_module}
         Restart=always
         RestartSec=5
 
@@ -330,6 +412,7 @@ def render_caddy(domain: str, port: int, log_name: str) -> str:
     labels = ", ".join(site_labels)
     return textwrap.dedent(
         f"""\
+        # Managed by flask-vps-deploy
         {labels} {{
             encode zstd gzip
 
@@ -350,10 +433,14 @@ def render_caddy(domain: str, port: int, log_name: str) -> str:
     )
 
 
-def apply_systemd(service_name: str) -> None:
-    print_step("Reloading systemd and starting app service")
+def apply_systemd(service_name: str, restart: bool) -> None:
+    print_step("Reloading systemd and applying app service")
     run(["systemctl", "daemon-reload"])
-    run(["systemctl", "enable", "--now", service_name])
+    run(["systemctl", "enable", service_name])
+    if restart:
+        run(["systemctl", "restart", service_name])
+    else:
+        run(["systemctl", "start", service_name])
     run(["systemctl", "is-active", service_name])
 
 
@@ -367,6 +454,15 @@ def apply_caddy() -> None:
     run(["systemctl", "enable", "--now", "caddy"])
     run(["systemctl", "reload", "caddy"])
     run(["systemctl", "is-active", "caddy"])
+
+
+def best_effort_restore_caddy() -> None:
+    run_optional(["caddy", "fmt", "--overwrite", "/etc/caddy/Caddyfile"])
+    sites_enabled = Path("/etc/caddy/sites-enabled")
+    for path in sorted(sites_enabled.glob("*.conf")):
+        run_optional(["caddy", "fmt", "--overwrite", str(path)])
+    run_optional(["caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+    run_optional(["systemctl", "reload", "caddy"])
 
 
 def read_existing_service_port(service_path: Path) -> int | None:
@@ -519,6 +615,74 @@ def clone_or_update_repo(repo_url: str, deploy_dir: Path) -> Path:
     return validate_project_dir(deploy_dir, "Repository checkout")
 
 
+def curl_succeeds(url: str, *, host: str | None = None, timeout: int = 5) -> bool:
+    cmd = ["curl", "-fsS", "-o", "/dev/null", "--max-time", str(timeout), url]
+    if host:
+        cmd.extend(["-H", f"Host: {host}"])
+    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return completed.returncode == 0
+
+
+def run_health_checks(port: int, domain: str, health_path: str, attempts: int = 10, delay: float = 1.0) -> None:
+    print_step("Running post-deploy health checks")
+    app_url = f"http://127.0.0.1:{port}{health_path}"
+    proxy_url = f"http://127.0.0.1{health_path}"
+
+    for attempt in range(1, attempts + 1):
+        app_ok = curl_succeeds(app_url)
+        proxy_ok = curl_succeeds(proxy_url, host=domain)
+        print(f"Health check attempt {attempt}/{attempts}: app={'ok' if app_ok else 'fail'}, proxy={'ok' if proxy_ok else 'fail'}")
+        if app_ok and proxy_ok:
+            return
+        time.sleep(delay)
+
+    raise SystemExit(
+        f"Health checks failed for {domain} after deployment. Checked {app_url} and {proxy_url} with Host={domain}."
+    )
+
+
+def rollback_deploy(
+    *,
+    service_name: str,
+    deploy_dir: Path,
+    deploy_backup_dir: Path,
+    had_deploy_backup: bool,
+    service_path: Path,
+    service_existed_before: bool,
+    site_path: Path,
+    site_existed_before: bool,
+    main_caddyfile: Path,
+    main_caddyfile_existed_before: bool,
+) -> None:
+    print_step("Deployment failed, attempting rollback")
+
+    if had_deploy_backup:
+        restore_deploy_dir(deploy_backup_dir, deploy_dir)
+    else:
+        print("No previous deploy backup found. Code directory will be left as-is.")
+
+    if service_existed_before:
+        restore_file_from_backup(service_path)
+    else:
+        run_optional(["systemctl", "disable", "--now", service_name])
+        remove_file_if_exists(service_path)
+
+    if site_existed_before:
+        restore_file_from_backup(site_path)
+    else:
+        remove_file_if_exists(site_path)
+
+    if main_caddyfile_existed_before:
+        restore_file_from_backup(main_caddyfile)
+    else:
+        remove_file_if_exists(main_caddyfile)
+
+    run_optional(["systemctl", "daemon-reload"])
+    if service_existed_before:
+        run_optional(["systemctl", "restart", service_name])
+    best_effort_restore_caddy()
+
+
 def print_summary(
     project_input: str,
     domain: str,
@@ -526,6 +690,10 @@ def print_summary(
     service_name: str,
     port: int,
     run_user: str,
+    workers: int,
+    timeout: int,
+    wsgi_module: str,
+    health_path: str,
 ) -> None:
     print("\nDeployment summary")
     print("------------------")
@@ -535,13 +703,133 @@ def print_summary(
     print(f"Service     : {service_name}")
     print(f"Run user    : {run_user}")
     print(f"App port    : 127.0.0.1:{port}")
+    print(f"WSGI module : {wsgi_module}")
+    print(f"Workers     : {workers}")
+    print(f"Timeout     : {timeout}")
+    print(f"Health path : {health_path}")
     print("Origin mode : Caddy HTTP only (Cloudflare handles HTTPS)")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Interactive VPS deploy wizard for Flask projects using uv, gunicorn, caddy, and systemd."
+def service_unit_name(service_name: str) -> str:
+    return service_name if service_name.endswith(".service") else f"{service_name}.service"
+
+
+def service_state(service_name: str) -> str:
+    completed = subprocess.run(
+        ["systemctl", "is-active", service_unit_name(service_name)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
+    return (completed.stdout or completed.stderr).strip() or "unknown"
+
+
+def is_managed_service(service_path: Path) -> bool:
+    content = service_path.read_text()
+    return "Managed by flask-vps-deploy" in content or (
+        "Flask app" in content and ".venv/bin/gunicorn" in content
+    )
+
+
+def extract_match(pattern: str, text: str) -> str | None:
+    match = re.search(pattern, text, re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def get_site_domain(service_name: str) -> str | None:
+    site_path = Path("/etc/caddy/sites-enabled") / f"{service_name}.conf"
+    if not site_path.exists():
+        return None
+    content = site_path.read_text()
+    return extract_match(r"http://([^,\s{]+)", content)
+
+
+def get_service_info(service_name: str) -> dict[str, str | int | None]:
+    normalized = service_unit_name(service_name)
+    service_path = Path("/etc/systemd/system") / normalized
+    if not service_path.exists():
+        raise SystemExit(f"Service file not found: {service_path}")
+
+    content = service_path.read_text()
+    port = read_existing_service_port(service_path)
+    info: dict[str, str | int | None] = {
+        "service_name": service_path.stem,
+        "service_path": str(service_path),
+        "deploy_dir": extract_match(r"^WorkingDirectory=(.+)$", content),
+        "run_user": extract_match(r"^User=(.+)$", content),
+        "domain": get_site_domain(service_path.stem),
+        "port": port,
+        "workers": extract_match(r"--workers\s+(\d+)", content),
+        "timeout": extract_match(r"--timeout\s+(\d+)", content),
+        "wsgi_module": extract_match(r"--timeout\s+\d+\s+(\S+:\S+)\s*$", content),
+        "state": service_state(service_path.stem),
+    }
+    return info
+
+
+def iter_managed_services() -> list[dict[str, str | int | None]]:
+    services: list[dict[str, str | int | None]] = []
+    for path in sorted(Path("/etc/systemd/system").glob("*.service")):
+        if not is_managed_service(path):
+            continue
+        services.append(get_service_info(path.stem))
+    return services
+
+
+def command_list(_: argparse.Namespace) -> None:
+    services = iter_managed_services()
+    if not services:
+        print("No flask-vps-deploy managed sites found.")
+        return
+
+    print("Managed sites")
+    print("-------------")
+    for info in services:
+        print(f"{info['service_name']} [{info['state']}]")
+        print(f"  domain    : {info['domain'] or '-'}")
+        print(f"  deploy dir: {info['deploy_dir'] or '-'}")
+        print(f"  port      : {info['port'] or '-'}")
+        print(f"  run user  : {info['run_user'] or '-'}")
+
+
+def command_status(args: argparse.Namespace) -> None:
+    if not args.service_name:
+        command_list(args)
+        return
+
+    info = get_service_info(args.service_name)
+    print("Service summary")
+    print("---------------")
+    print(f"Service    : {info['service_name']}")
+    print(f"State      : {info['state']}")
+    print(f"Domain     : {info['domain'] or '-'}")
+    print(f"Deploy dir : {info['deploy_dir'] or '-'}")
+    print(f"Port       : {info['port'] or '-'}")
+    print(f"Run user   : {info['run_user'] or '-'}")
+    print(f"Workers    : {info['workers'] or '-'}")
+    print(f"Timeout    : {info['timeout'] or '-'}")
+    print(f"WSGI module: {info['wsgi_module'] or '-'}")
+    run(["systemctl", "status", service_unit_name(args.service_name), "--no-pager"])
+
+
+def command_logs(args: argparse.Namespace) -> None:
+    cmd = ["journalctl", "-u", service_unit_name(args.service_name), "-n", str(args.lines)]
+    if args.follow:
+        cmd.append("-f")
+    else:
+        cmd.append("--no-pager")
+    run(cmd)
+
+
+def command_self_update(_: argparse.Namespace) -> None:
+    require_root()
+    print_step("Updating flask-vps-deploy")
+    run_shell(f"curl -fsSL {INSTALL_SCRIPT_URL} | bash")
+
+
+def build_deploy_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--source-dir",
         help="Local project source directory. Defaults to the current directory when --repo-url is not provided, then syncs into the deploy directory.",
@@ -552,19 +840,54 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--service-name", help="systemd service name. Defaults to the project name.")
     parser.add_argument("--port", type=int, help="Internal Gunicorn port. Defaults to an auto-selected free port.")
     parser.add_argument("--run-user", help="Linux user for the app service. Defaults to www-data or caddy.")
+    parser.add_argument("--wsgi-module", default=DEFAULT_WSGI_MODULE, help=f"Gunicorn app entrypoint. Default: {DEFAULT_WSGI_MODULE}")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Gunicorn worker count. Default: {DEFAULT_WORKERS}")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Gunicorn timeout in seconds. Default: {DEFAULT_TIMEOUT}")
+    parser.add_argument("--health-path", default=DEFAULT_HEALTH_PATH, help=f"Path used for post-deploy health checks. Default: {DEFAULT_HEALTH_PATH}")
+    parser.add_argument("--skip-health-check", action="store_true", help="Skip the post-deploy health check and rollback logic.")
     parser.add_argument("--yes", action="store_true", help="Accept defaults without confirmation.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Flask VPS deploy and maintenance toolkit.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy or update a Flask site.")
+    build_deploy_parser(deploy_parser)
+
+    status_parser = subparsers.add_parser("status", help="Show status for a deployed site.")
+    status_parser.add_argument("service_name", nargs="?", help="Service name. If omitted, all managed sites are listed.")
+
+    logs_parser = subparsers.add_parser("logs", help="Show logs for a deployed site.")
+    logs_parser.add_argument("service_name", help="Service name.")
+    logs_parser.add_argument("-n", "--lines", type=int, default=100, help="Number of log lines to show. Default: 100")
+    logs_parser.add_argument("-f", "--follow", action="store_true", help="Follow logs in real time.")
+
+    subparsers.add_parser("list", help="List all managed sites.")
+    subparsers.add_parser("self-update", help="Update flask-vps-deploy itself from GitHub.")
     return parser
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args()
+    if raw_args and raw_args[0] in {"-h", "--help"}:
+        return parser.parse_args(raw_args)
+    if not raw_args or raw_args[0].startswith("-") or raw_args[0] not in KNOWN_COMMANDS:
+        raw_args = ["deploy", *raw_args]
+    return parser.parse_args(raw_args)
 
+
+def command_deploy(args: argparse.Namespace) -> None:
     require_root()
     if not shutil.which("systemctl"):
         raise SystemExit("systemd is required on the target VPS.")
     if args.source_dir and args.repo_url:
         raise SystemExit("Use either --source-dir or --repo-url, not both.")
+
+    workers = ensure_positive(args.workers, "--workers")
+    timeout = ensure_positive(args.timeout, "--timeout")
+    health_path = normalize_health_path(args.health_path)
 
     repo_url = args.repo_url
     if repo_url is None:
@@ -601,39 +924,107 @@ def main() -> None:
     run_user, run_group = ensure_user_and_group(run_user_input)
 
     service_path = Path("/etc/systemd/system") / f"{service_name}.service"
+    site_path = Path("/etc/caddy/sites-enabled") / f"{service_name}.conf"
+    main_caddyfile = Path("/etc/caddy/Caddyfile")
     port = choose_port(args.port, service_path)
 
-    print_summary(project_input, domain, deploy_dir, service_name, port, run_user)
+    print_summary(
+        project_input,
+        domain,
+        deploy_dir,
+        service_name,
+        port,
+        run_user,
+        workers,
+        timeout,
+        args.wsgi_module,
+        health_path,
+    )
     if not args.yes and not prompt_yes_no("Continue with deployment?", True):
         raise SystemExit("Cancelled.")
 
-    if repo_url:
-        project_dir = clone_or_update_repo(repo_url, deploy_dir)
+    service_existed_before = service_path.exists()
+    site_existed_before = site_path.exists()
+    main_caddyfile_existed_before = main_caddyfile.exists()
+    deploy_backup_dir = BACKUP_ROOT / service_name
+    had_deploy_backup = snapshot_deploy_dir(deploy_dir, deploy_backup_dir)
+
+    try:
+        if repo_url:
+            project_dir = clone_or_update_repo(repo_url, deploy_dir)
+            run(["chown", "-R", f"{run_user}:{run_group}", str(project_dir)])
+        else:
+            sync_project(source_dir, deploy_dir, run_user, run_group)
+            project_dir = deploy_dir
+
+        sync_python_env(project_dir)
         run(["chown", "-R", f"{run_user}:{run_group}", str(project_dir)])
-    else:
-        sync_project(source_dir, deploy_dir, run_user, run_group)
-        project_dir = deploy_dir
 
-    sync_python_env(project_dir)
-    run(["chown", "-R", f"{run_user}:{run_group}", str(project_dir)])
+        print_step("Writing systemd and Caddy configuration")
+        Path("/var/log/caddy").mkdir(parents=True, exist_ok=True)
+        write_text_file(
+            service_path,
+            render_service(
+                service_name,
+                project_dir,
+                run_user,
+                run_group,
+                port,
+                workers,
+                timeout,
+                args.wsgi_module,
+            ),
+        )
+        ensure_caddy_import(main_caddyfile)
+        write_text_file(site_path, render_caddy(domain, port, service_name))
 
-    print_step("Writing systemd and Caddy configuration")
-    Path("/var/log/caddy").mkdir(parents=True, exist_ok=True)
-    site_path = Path("/etc/caddy/sites-enabled") / f"{service_name}.conf"
-    main_caddyfile = Path("/etc/caddy/Caddyfile")
+        apply_systemd(service_name, restart=service_existed_before)
+        apply_caddy()
 
-    write_text_file(service_path, render_service(service_name, project_dir, run_user, run_group, port))
-    ensure_caddy_import(main_caddyfile)
-    write_text_file(site_path, render_caddy(domain, port, service_name))
+        if not args.skip_health_check:
+            run_health_checks(port, domain, health_path)
 
-    apply_systemd(service_name)
-    apply_caddy()
+        print("\nDone")
+        print("----")
+        print(f"App service : systemctl status {service_name}")
+        print(f"Caddy config: {site_path}")
+        print(f"Origin URL  : http://{domain}")
+    except (SystemExit, subprocess.CalledProcessError):
+        rollback_deploy(
+            service_name=service_name,
+            deploy_dir=deploy_dir,
+            deploy_backup_dir=deploy_backup_dir,
+            had_deploy_backup=had_deploy_backup,
+            service_path=service_path,
+            service_existed_before=service_existed_before,
+            site_path=site_path,
+            site_existed_before=site_existed_before,
+            main_caddyfile=main_caddyfile,
+            main_caddyfile_existed_before=main_caddyfile_existed_before,
+        )
+        raise
 
-    print("\nDone")
-    print("----")
-    print(f"App service : systemctl status {service_name}")
-    print(f"Caddy config: {site_path}")
-    print(f"Origin URL  : http://{domain}")
+
+def main() -> None:
+    args = parse_args()
+
+    if args.command == "deploy":
+        command_deploy(args)
+        return
+    if args.command == "status":
+        command_status(args)
+        return
+    if args.command == "logs":
+        command_logs(args)
+        return
+    if args.command == "list":
+        command_list(args)
+        return
+    if args.command == "self-update":
+        command_self_update(args)
+        return
+
+    raise SystemExit(f"Unknown command: {args.command}")
 
 
 if __name__ == "__main__":

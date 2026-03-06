@@ -8,14 +8,16 @@ Reusable Linux VPS deployment toolkit for Flask projects.
 - checks whether `caddy` is installed and, on Debian or Ubuntu, installs it from the official Caddy apt repository before upgrading
 - installs `uv` if it is missing
 - deploys from either the current local project directory or a Git repository URL
+- restarts an existing app service after redeploy so new code is actually loaded
+- runs post-deploy health checks and rolls back to the previous version if checks fail
 - creates a `systemd` service for `gunicorn`
 - creates a `Caddy` site config for HTTP-only reverse proxy to support Cloudflare origin mode
-- starts or reloads the required services
+- provides built-in `status`, `logs`, `list`, and `self-update` commands
 
 ## Included scripts
 
 - `install.sh`: one-line installer for VPS usage
-- `scripts/flask_vps_deploy.py`: interactive deployment wizard
+- `scripts/flask_vps_deploy.py`: interactive deployment and maintenance CLI
 - `scripts/install_flask_vps_deploy.sh`: local installer used by `install.sh`
 
 ## Install on a VPS
@@ -36,23 +38,43 @@ cd flask-vps-deploy
 sudo bash scripts/install_flask_vps_deploy.sh
 ```
 
-After installation, you can run the tool in two ways.
+## Main commands
 
-Inside a local Flask project directory:
+Deploy or update a site:
 
 ```bash
 sudo flask-vps-deploy
 ```
 
-From anywhere by giving it a repository URL:
+Show one service status, or all managed sites if omitted:
 
 ```bash
-sudo flask-vps-deploy --repo-url https://github.com/yourname/your-flask-app.git
+flask-vps-deploy status
+flask-vps-deploy status anime-tactical-simulator-site
 ```
 
-## Interactive flow
+Show logs:
 
-The wizard now asks for these values in order:
+```bash
+flask-vps-deploy logs anime-tactical-simulator-site
+flask-vps-deploy logs anime-tactical-simulator-site -f
+```
+
+List all managed sites:
+
+```bash
+flask-vps-deploy list
+```
+
+Update the deployment tool itself:
+
+```bash
+sudo flask-vps-deploy self-update
+```
+
+## Interactive deploy flow
+
+The deploy wizard asks for these values in order:
 
 - Git repository URL, or blank to use the current directory as the source
 - deploy directory, defaulting to `/srv/www/<project-name>`
@@ -64,6 +86,23 @@ If the service already exists, the script reuses its existing internal Gunicorn 
 If the service is new, the script automatically picks a free port between `8100` and `8999`.
 If you leave the repository URL blank, the current directory must already be the Flask project source directory.
 
+## Deploy behavior
+
+Repository mode:
+
+- existing checkout: `git fetch --all --prune` + `git pull --ff-only`
+- new checkout: `git clone`
+
+Local source mode:
+
+- syncs the current source directory into the deploy directory with `rsync`
+
+Redeploy behavior:
+
+- an existing service is explicitly restarted after files and dependencies are updated
+- post-deploy health checks probe both Gunicorn and Caddy locally
+- if health checks fail, the tool restores the previous deploy directory and config files when backups exist
+
 ## Defaults
 
 - Python environment: `uv`
@@ -72,9 +111,21 @@ If you leave the repository URL blank, the current directory must already be the
 - Process supervisor: `systemd`
 - Default deploy root: `/srv/www/<service-name>`
 - Internal app port: auto-selected free port on `127.0.0.1`
+- Gunicorn workers: `2`
+- Gunicorn timeout: `60`
+- WSGI module: `wsgi:app`
+- Health check path: `/`
 - Caddy origin mode: HTTP only, intended for Cloudflare-proxied domains
 
-## Non-interactive examples
+## Common deploy examples
+
+Deploy directly from GitHub:
+
+```bash
+sudo flask-vps-deploy \
+  --repo-url https://github.com/yourname/your-flask-app.git \
+  --domain example.com
+```
 
 Deploy from the current directory as the source, then sync into `/srv/www/<service-name>`:
 
@@ -86,24 +137,16 @@ sudo flask-vps-deploy \
   --yes
 ```
 
-Deploy directly from GitHub:
+Override Gunicorn settings and health path:
 
 ```bash
 sudo flask-vps-deploy \
   --repo-url https://github.com/yourname/your-flask-app.git \
   --domain example.com \
-  --service-name example-app \
-  --deploy-dir /srv/www/example-app \
-  --yes
-```
-
-Override the internal Gunicorn port manually:
-
-```bash
-sudo flask-vps-deploy \
-  --repo-url https://github.com/yourname/your-flask-app.git \
-  --domain example.com \
-  --port 8201 \
+  --workers 4 \
+  --timeout 120 \
+  --wsgi-module app:app \
+  --health-path /healthz \
   --yes
 ```
 
@@ -114,6 +157,8 @@ The target Flask project should contain at least:
 - `pyproject.toml`
 - `app.py`
 - `wsgi.py`
+
+If you use a different entrypoint, pass it with `--wsgi-module`.
 
 ## Git behavior
 
@@ -138,6 +183,7 @@ That keeps the origin side HTTP-only so Cloudflare can terminate HTTPS at the ed
 ## Notes
 
 - Existing generated service and Caddy config files are backed up with a `.bak` suffix before overwrite.
+- Existing deploy directories are backed up under `/var/lib/flask-vps-deploy/backups/<service-name>/` before update.
 - The tool targets Linux systems with `apt-get`, `dnf`, or `yum` and requires `systemd`.
 - On Debian or Ubuntu, the script configures the official Caddy apt repository from Caddy before installing or upgrading `caddy`.
 - Existing deployments reuse their current internal port so multiple sites can coexist on the same VPS.
