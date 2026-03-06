@@ -54,7 +54,7 @@ sudo flask-vps-deploy --repo-url https://github.com/yourname/your-flask-app.git
 
 The wizard now asks for these values in order:
 
-- Git repository URL, or blank to use the current directory
+- Git repository URL, or blank to read source from the current directory
 - domain name
 - service name, defaulting to the project name
 - deploy directory, defaulting to `/srv/www/<service-name>`
@@ -75,7 +75,7 @@ If the service is new, the script automatically picks a free port between `8100`
 
 ## Non-interactive examples
 
-Deploy from the current directory:
+Deploy from the current directory as the source, then sync into `/srv/www/<service-name>`:
 
 ```bash
 sudo flask-vps-deploy \

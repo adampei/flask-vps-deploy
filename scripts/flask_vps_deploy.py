@@ -524,7 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source-dir",
-        help="Local project source directory. Defaults to the current directory when --repo-url is not provided.",
+        help="Local project source directory. Defaults to the current directory when --repo-url is not provided, then syncs into the deploy directory.",
     )
     parser.add_argument("--repo-url", help="Git repository URL to clone or pull before deployment.")
     parser.add_argument("--domain", help="Primary domain for Caddy.")
@@ -548,7 +548,7 @@ def main() -> None:
 
     repo_url = args.repo_url
     if repo_url is None:
-        repo_url = prompt("Git repository URL (leave blank to use current directory)")
+        repo_url = prompt("Git repository URL (leave blank to read source from current directory and deploy into /srv/www/...)")
     repo_url = repo_url.strip() or None
 
     source_dir: Path | None = None
